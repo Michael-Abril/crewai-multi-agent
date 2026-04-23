@@ -30,7 +30,8 @@ def make_llm():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if not AKASH_API_KEY:
-        raise RuntimeError("AKASH_API_KEY environment variable is not set")
+        # Continue startup — /health will return 503 until key is available
+        print("WARNING: AKASH_API_KEY not set. Crew runs will fail until configured.")
     yield
 
 
