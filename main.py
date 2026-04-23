@@ -1,13 +1,15 @@
 """
 Multi-agent research + writing pipeline using Akash ML API (Llama 3.3 70B).
-Two sequential agents: Researcher → Writer. Uses httpx for LLM calls.
+Two sequential agents: Researcher → Writer. Uses stdlib urllib for LLM calls.
+No extra packages beyond fastapi+uvicorn — avoids pip install timeouts on Akash.
 """
+import json
 import os
 import time
+import urllib.request
 import uuid
 from contextlib import asynccontextmanager
 
-import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -32,22 +34,30 @@ AGENTS_LIST = [
 
 
 def llm_call(system: str, user: str, max_tokens: int = 512) -> str:
-    with httpx.Client(timeout=120.0) as client:
-        resp = client.post(
-            f"{AKASH_BASE_URL}/chat/completions",
-            headers={"Authorization": f"Bearer {AKASH_API_KEY}"},
-            json={
-                "model": MODEL,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                "max_tokens": max_tokens,
-                "temperature": 0.3,
-            },
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
+    payload = json.dumps(
+        {
+            "model": MODEL,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "max_tokens": max_tokens,
+            "temperature": 0.3,
+        }
+    ).encode()
+
+    req = urllib.request.Request(
+        f"{AKASH_BASE_URL}/chat/completions",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {AKASH_API_KEY}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        data = json.loads(resp.read())
+    return data["choices"][0]["message"]["content"]
 
 
 def _run_pipeline(job_id: str, topic: str) -> None:
