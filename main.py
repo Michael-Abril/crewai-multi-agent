@@ -1,15 +1,15 @@
 """
 Multi-agent research + writing pipeline using Akash ML API (Llama 3.3 70B).
-Two sequential agents: Researcher → Writer. No heavy framework deps.
+Two sequential agents: Researcher → Writer. Uses httpx for LLM calls.
 """
 import os
 import time
 import uuid
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import JSONResponse
-from openai import OpenAI
 from pydantic import BaseModel
 
 AKASH_API_KEY = os.environ.get("AKASH_API_KEY", "")
@@ -18,7 +18,7 @@ MODEL = "Meta-Llama-3-3-70B-Instruct"
 
 jobs: dict = {}
 
-AGENTS = [
+AGENTS_LIST = [
     {
         "name": "Researcher",
         "role": "Gathers key facts about the requested topic",
@@ -33,14 +33,22 @@ AGENTS = [
 
 
 def llm_call(system: str, user: str, max_tokens: int = 512) -> str:
-    client = OpenAI(api_key=AKASH_API_KEY, base_url=AKASH_BASE_URL)
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        max_tokens=max_tokens,
-        temperature=0.3,
-    )
-    return response.choices[0].message.content or ""
+    with httpx.Client(timeout=120.0) as client:
+        resp = client.post(
+            f"{AKASH_BASE_URL}/chat/completions",
+            headers={"Authorization": f"Bearer {AKASH_API_KEY}"},
+            json={
+                "model": MODEL,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                "max_tokens": max_tokens,
+                "temperature": 0.3,
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
 
 
 def _run_pipeline(job_id: str, topic: str) -> None:
@@ -68,13 +76,12 @@ def _run_pipeline(job_id: str, topic: str) -> None:
             max_tokens=800,
         )
 
-        duration = round(time.time() - start, 2)
         jobs[job_id].update(
             {
                 "status": "done",
                 "result": report,
                 "research_notes": research,
-                "duration_seconds": duration,
+                "duration_seconds": round(time.time() - start, 2),
             }
         )
     except Exception as exc:
@@ -84,7 +91,7 @@ def _run_pipeline(job_id: str, topic: str) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if not AKASH_API_KEY:
-        print("WARNING: AKASH_API_KEY not set. Crew runs will fail until configured.")
+        print("WARNING: AKASH_API_KEY not set. LLM calls will fail until configured.")
     yield
 
 
@@ -97,17 +104,12 @@ class RunRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    if not AKASH_API_KEY:
-        return JSONResponse(
-            status_code=503,
-            content={"status": "error", "detail": "AKASH_API_KEY not configured"},
-        )
     return {"status": "ok"}
 
 
 @app.get("/agents")
 def list_agents():
-    return {"agents": AGENTS}
+    return {"agents": AGENTS_LIST}
 
 
 @app.post("/run")
