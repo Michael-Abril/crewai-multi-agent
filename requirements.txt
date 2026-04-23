@@ -1,5 +1,4 @@
 fastapi==0.115.5
 uvicorn[standard]==0.34.0
-crewai==0.80.0
-langchain-openai==0.3.8
+openai==1.54.3
 pydantic==2.10.3

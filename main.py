@@ -1,3 +1,7 @@
+"""
+Multi-agent research + writing pipeline using Akash ML API (Llama 3.3 70B).
+Two sequential agents: Researcher → Writer. No heavy framework deps.
+"""
 import os
 import time
 import uuid
@@ -5,104 +9,71 @@ from contextlib import asynccontextmanager
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import JSONResponse
+from openai import OpenAI
 from pydantic import BaseModel
 
 AKASH_API_KEY = os.environ.get("AKASH_API_KEY", "")
 AKASH_BASE_URL = "https://chatapi.akash.network/api/v1"
 MODEL = "Meta-Llama-3-3-70B-Instruct"
 
-# In-memory job store
 jobs: dict = {}
 
+AGENTS = [
+    {
+        "name": "Researcher",
+        "role": "Gathers key facts about the requested topic",
+        "model": MODEL,
+    },
+    {
+        "name": "Writer",
+        "role": "Synthesizes research into a clear multi-paragraph report",
+        "model": MODEL,
+    },
+]
 
-def make_llm():
-    from langchain_openai import ChatOpenAI
 
-    return ChatOpenAI(
+def llm_call(system: str, user: str, max_tokens: int = 512) -> str:
+    client = OpenAI(api_key=AKASH_API_KEY, base_url=AKASH_BASE_URL)
+    response = client.chat.completions.create(
         model=MODEL,
-        api_key=AKASH_API_KEY,
-        base_url=AKASH_BASE_URL,
-        max_tokens=1024,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        max_tokens=max_tokens,
         temperature=0.3,
     )
+    return response.choices[0].message.content or ""
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    if not AKASH_API_KEY:
-        # Continue startup — /health will return 503 until key is available
-        print("WARNING: AKASH_API_KEY not set. Crew runs will fail until configured.")
-    yield
-
-
-app = FastAPI(title="CrewAI Multi-Agent API", lifespan=lifespan)
-
-
-class RunRequest(BaseModel):
-    topic: str
-
-
-def _run_crew(job_id: str, topic: str) -> None:
-    from crewai import Agent, Crew, Task
-
+def _run_pipeline(job_id: str, topic: str) -> None:
     try:
         jobs[job_id]["status"] = "running"
         start = time.time()
 
-        llm = make_llm()
-
-        researcher = Agent(
-            role="Researcher",
-            goal=f"Gather key facts about: {topic}",
-            backstory="You are a concise researcher who extracts the most important facts on any topic.",
-            llm=llm,
-            max_iter=3,
-            verbose=False,
-            allow_delegation=False,
-        )
-
-        writer = Agent(
-            role="Writer",
-            goal=f"Write a clear, multi-paragraph report about: {topic}",
-            backstory="You are a technical writer who produces well-structured, jargon-free reports.",
-            llm=llm,
-            max_iter=3,
-            verbose=False,
-            allow_delegation=False,
-        )
-
-        research_task = Task(
-            description=(
-                f"Research the topic: '{topic}'. "
-                "Produce exactly 5 bullet points, each one sentence, covering the most important facts."
+        # Agent 1 — Researcher
+        research = llm_call(
+            system=(
+                "You are a concise researcher. Given a topic, produce exactly 5 bullet points "
+                "covering the most important facts. Each bullet is one clear sentence."
             ),
-            expected_output="5 concise bullet points about the topic.",
-            agent=researcher,
+            user=f"Research topic: {topic}",
+            max_tokens=400,
         )
 
-        write_task = Task(
-            description=(
-                f"Using the research notes, write a 3-paragraph report about: '{topic}'. "
-                "Each paragraph must be at least 3 sentences. Do not use bullet points."
+        # Agent 2 — Writer (receives Researcher output as context)
+        report = llm_call(
+            system=(
+                "You are a technical writer. Given research notes, write a 3-paragraph report. "
+                "Each paragraph must be at least 3 sentences. Use prose, not bullet points."
             ),
-            expected_output="A 3-paragraph prose report.",
-            agent=writer,
-            context=[research_task],
+            user=f"Research notes:\n{research}\n\nWrite a report about: {topic}",
+            max_tokens=800,
         )
 
-        crew = Crew(
-            agents=[researcher, writer],
-            tasks=[research_task, write_task],
-            verbose=False,
-        )
-
-        result = crew.kickoff()
         duration = round(time.time() - start, 2)
-
         jobs[job_id].update(
             {
                 "status": "done",
-                "result": str(result),
+                "result": report,
+                "research_notes": research,
                 "duration_seconds": duration,
             }
         )
@@ -110,38 +81,40 @@ def _run_crew(job_id: str, topic: str) -> None:
         jobs[job_id].update({"status": "error", "error": str(exc)})
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if not AKASH_API_KEY:
+        print("WARNING: AKASH_API_KEY not set. Crew runs will fail until configured.")
+    yield
+
+
+app = FastAPI(title="Multi-Agent Research API", lifespan=lifespan)
+
+
+class RunRequest(BaseModel):
+    topic: str
+
+
 @app.get("/health")
 def health():
     if not AKASH_API_KEY:
         return JSONResponse(
-            status_code=503, content={"status": "error", "detail": "AKASH_API_KEY not configured"}
+            status_code=503,
+            content={"status": "error", "detail": "AKASH_API_KEY not configured"},
         )
     return {"status": "ok"}
 
 
 @app.get("/agents")
 def list_agents():
-    return {
-        "agents": [
-            {
-                "name": "Researcher",
-                "role": "Gathers key facts about the requested topic",
-                "model": MODEL,
-            },
-            {
-                "name": "Writer",
-                "role": "Synthesizes research into a clear multi-paragraph report",
-                "model": MODEL,
-            },
-        ]
-    }
+    return {"agents": AGENTS}
 
 
 @app.post("/run")
-def run_crew(request: RunRequest, background_tasks: BackgroundTasks):
+def run_pipeline(request: RunRequest, background_tasks: BackgroundTasks):
     job_id = str(uuid.uuid4())
     jobs[job_id] = {"status": "queued", "topic": request.topic}
-    background_tasks.add_task(_run_crew, job_id, request.topic)
+    background_tasks.add_task(_run_pipeline, job_id, request.topic)
     return {"job_id": job_id, "status": "queued"}
 
 
