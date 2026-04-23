@@ -9,7 +9,6 @@ from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 AKASH_API_KEY = os.environ.get("AKASH_API_KEY", "")
